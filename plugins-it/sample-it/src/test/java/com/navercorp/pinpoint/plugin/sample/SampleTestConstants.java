@@ -19,6 +19,6 @@ package com.navercorp.pinpoint.plugin.sample;
  *
  */
 public interface SampleTestConstants {
-    String VERSION = "2.3.0-SNAPSHOT";
+    String VERSION = "3.0.4";
     String AGENT_PATH = "../../agent/target/pinpoint-agent-" + VERSION;
 }

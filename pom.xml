@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.navercorp.pinpoint</groupId>
         <artifactId>pinpoint</artifactId>
-        <version>2.3.0-SNAPSHOT</version>
+        <version>3.0.4</version>
     </parent>
 
     <artifactId>sample-pinpoint</artifactId>
@@ -13,6 +13,18 @@
     <packaging>pom</packaging>
 
     <properties>
+        <!-- Missing properties -->
+        <log4j2-jdk8.version>2.12.1</log4j2-jdk8.version>
+        <guava-jdk8.version>29.0-jre</guava-jdk8.version>
+        <spring5.version>5.2.9.RELEASE</spring5.version>
+        <spring.boot.version>2.2.6.RELEASE</spring.boot.version>
+        <spring.security5.version>5.2.2.RELEASE</spring.security5.version>
+        <javax.servlet4.version>4.0.1</javax.servlet4.version>
+        <plugin.failsafe.version>2.22.2</plugin.failsafe.version>
+        <plugin.surefire.version>2.22.2</plugin.surefire.version>
+        <jdk.version>1.8</jdk.version>
+        <encoding>UTF-8</encoding>
+
         <!-- frontend-plugin -->
         <plugin.frontend.version>1.9.0</plugin.frontend.version>
         <!-- https://nodejs.org/ko/download/releases/ -->
