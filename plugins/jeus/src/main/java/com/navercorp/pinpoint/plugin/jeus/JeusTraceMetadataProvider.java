@@ -8,5 +8,7 @@ public class JeusTraceMetadataProvider implements TraceMetadataProvider {
     public void setup(TraceMetadataSetupContext context) {
         context.addServiceType(JeusConstants.JEUS);
         context.addServiceType(JeusConstants.JEUS_METHOD);
+        // DataSource 모니터링용 ServiceType 추가
+        context.addServiceType(JeusConstants.JEUS_DATASOURCE);
     }
 }

@@ -12,4 +12,10 @@ public final class JeusConstants {
             ServiceTypeProperty.RECORD_STATISTICS, ServiceTypeProperty.INCLUDE_DESTINATION_ID);
     
     public static final ServiceType JEUS_METHOD = ServiceTypeFactory.of(7011, "JEUS_METHOD", "JEUS_METHOD");
+    
+    // JEUS DataSource 관련 상수
+    public static final ServiceType JEUS_DATASOURCE = ServiceTypeFactory.of(7012, "JEUS_DATASOURCE");
+    
+    // DataSource 모니터링 대상 클래스
+    public static final String JEUS_CONNECTION_POOL_IMPL = "jeus.jdbc.connectionpool.ConnectionPoolImpl";
 }

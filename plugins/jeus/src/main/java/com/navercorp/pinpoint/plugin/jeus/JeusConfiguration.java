@@ -13,6 +13,10 @@ public class JeusConfiguration {
     private final ExcludeUrlFilter jeusExcludeUrlFilter;
     private final boolean jeusTraceRequestParam;
     private final boolean jeusHidePinpointHeader;
+    
+    // DataSource 모니터링 설정
+    private final boolean jeusDataSourceEnabled;
+    private final boolean jeusDataSourceMonitorEnabled;
 
     public JeusConfiguration(ProfilerConfig config) {
         this.jeusEnabled = config.readBoolean("profiler.jeus.enable", true);
@@ -23,6 +27,10 @@ public class JeusConfiguration {
         
         this.jeusTraceRequestParam = config.readBoolean("profiler.jeus.trace.requestparam", true);
         this.jeusHidePinpointHeader = config.readBoolean("profiler.jeus.hidepinpointheader", true);
+        
+        // DataSource 모니터링 설정
+        this.jeusDataSourceEnabled = config.readBoolean("profiler.jeus.datasource.enable", true);
+        this.jeusDataSourceMonitorEnabled = config.readBoolean("profiler.jeus.datasource.monitor.enable", true);
     }
 
     public boolean isJeusEnabled() {
@@ -43,6 +51,14 @@ public class JeusConfiguration {
 
     public boolean isJeusHidePinpointHeader() {
         return jeusHidePinpointHeader;
+    }
+    
+    public boolean isJeusDataSourceEnabled() {
+        return jeusDataSourceEnabled;
+    }
+    
+    public boolean isJeusDataSourceMonitorEnabled() {
+        return jeusDataSourceMonitorEnabled;
     }
 
     public static class ExcludeUrlFilter {
