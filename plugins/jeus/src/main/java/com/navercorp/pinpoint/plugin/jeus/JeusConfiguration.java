@@ -16,7 +16,10 @@ public class JeusConfiguration {
     
     // DataSource 모니터링 설정
     private final boolean jeusDataSourceEnabled;
-    private final boolean jeusDataSourceMonitorEnabled;
+
+    // 메서드 트레이싱 설정
+    private final boolean jeusMethodTraceEnabled;
+    private final List<String> jeusTraceClasses;
 
     public JeusConfiguration(ProfilerConfig config) {
         this.jeusEnabled = config.readBoolean("profiler.jeus.enable", true);
@@ -30,7 +33,10 @@ public class JeusConfiguration {
         
         // DataSource 모니터링 설정
         this.jeusDataSourceEnabled = config.readBoolean("profiler.jeus.datasource.enable", true);
-        this.jeusDataSourceMonitorEnabled = config.readBoolean("profiler.jeus.datasource.monitor.enable", true);
+
+        // 메서드 트레이싱 설정
+        this.jeusMethodTraceEnabled = config.readBoolean("profiler.jeus.method.trace.enable", true);
+        this.jeusTraceClasses = config.readList("profiler.jeus.trace.classes");
     }
 
     public boolean isJeusEnabled() {
@@ -56,9 +62,13 @@ public class JeusConfiguration {
     public boolean isJeusDataSourceEnabled() {
         return jeusDataSourceEnabled;
     }
-    
-    public boolean isJeusDataSourceMonitorEnabled() {
-        return jeusDataSourceMonitorEnabled;
+
+    public boolean isJeusMethodTraceEnabled() {
+        return jeusMethodTraceEnabled;
+    }
+
+    public List<String> getJeusTraceClasses() {
+        return jeusTraceClasses;
     }
 
     public static class ExcludeUrlFilter {
