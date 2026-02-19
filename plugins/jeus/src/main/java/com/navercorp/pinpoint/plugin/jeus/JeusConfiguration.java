@@ -19,7 +19,8 @@ public class JeusConfiguration {
 
     // 메서드 트레이싱 설정
     private final boolean jeusMethodTraceEnabled;
-    private final List<String> jeusTraceClasses;
+    private final List<String> jeusTracePackages;  // 패키지 패턴 (신규)
+    private final List<String> jeusTraceClasses;   // 클래스 목록 (기존 호환)
 
     public JeusConfiguration(ProfilerConfig config) {
         this.jeusEnabled = config.readBoolean("profiler.jeus.enable", true);
@@ -36,7 +37,8 @@ public class JeusConfiguration {
 
         // 메서드 트레이싱 설정
         this.jeusMethodTraceEnabled = config.readBoolean("profiler.jeus.method.trace.enable", true);
-        this.jeusTraceClasses = config.readList("profiler.jeus.trace.classes");
+        this.jeusTracePackages = config.readList("profiler.jeus.trace.packages");  // 패키지 패턴 (신규)
+        this.jeusTraceClasses = config.readList("profiler.jeus.trace.classes");    // 클래스 목록 (기존 호환)
     }
 
     public boolean isJeusEnabled() {
@@ -65,6 +67,10 @@ public class JeusConfiguration {
 
     public boolean isJeusMethodTraceEnabled() {
         return jeusMethodTraceEnabled;
+    }
+
+    public List<String> getJeusTracePackages() {
+        return jeusTracePackages;
     }
 
     public List<String> getJeusTraceClasses() {
