@@ -48,11 +48,11 @@ public class HimedMethodInterceptor implements AroundInterceptor {
             return;
         }
 
-        if (!trace.canSampled()) {
-            return;
-        }
-
         try {
+            if (!trace.canSampled()) {
+                return;
+            }
+
             SpanEventRecorder recorder = trace.currentSpanEventRecorder();
 
             // 메서드 정보 기록
@@ -68,7 +68,7 @@ public class HimedMethodInterceptor implements AroundInterceptor {
                 logger.warn("[JEUS-PLUGIN] HimedMethodInterceptor.after error: " + t.getMessage(), t);
             }
         } finally {
-            // SpanEvent 종료
+            // SpanEvent 종료 - canSampled 여부와 무관하게 항상 호출
             trace.traceBlockEnd();
         }
     }

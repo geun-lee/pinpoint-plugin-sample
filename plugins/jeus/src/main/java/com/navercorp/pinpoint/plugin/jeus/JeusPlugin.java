@@ -21,7 +21,6 @@ import com.navercorp.pinpoint.plugin.jeus.interceptor.WebActionDispatcherService
 import java.lang.reflect.Modifier;
 import java.security.ProtectionDomain;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAware {
     private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
@@ -55,33 +54,33 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
             addConnectionPoolTransform();
         }
     }
-    
+
     /**
      * WebActionDispatcher Transform (기존 로직)
      */
     private void addWebActionDispatcherTransform() {
         transformTemplate.transform("himed.his.hit.web.action.WebActionDispatcher", new TransformCallback() {
             @Override
-            public byte[] doInTransform(Instrumentor instrumentor, ClassLoader classLoader, String className, 
+            public byte[] doInTransform(Instrumentor instrumentor, ClassLoader classLoader, String className,
                     Class<?> classBeingRedefined, ProtectionDomain protectionDomain, byte[] classfileBuffer) throws InstrumentException {
                 logger.info("[JEUS-PLUGIN] Transforming class: " + className);
                 InstrumentClass target = instrumentor.getInstrumentClass(classLoader, className, classfileBuffer);
-                
-                InstrumentMethod serviceMethod = target.getDeclaredMethod("service", 
+
+                InstrumentMethod serviceMethod = target.getDeclaredMethod("service",
                         "javax.servlet.http.HttpServletRequest", "javax.servlet.http.HttpServletResponse");
-                
+
                 if (serviceMethod != null) {
                     logger.info("[JEUS-PLUGIN] Found service method. Adding interceptor.");
                     serviceMethod.addInterceptor(WebActionDispatcherServiceInterceptor.class);
                 } else {
                     logger.warn("[JEUS-PLUGIN] service method not found in " + className);
                 }
-                
+
                 return target.toBytecode();
             }
         });
     }
-    
+
     /**
      * himed.his 패키지 하위 클래스들의 메서드를 트레이싱.
      * 1. 패키지 패턴 기반 (신규 방식) - profiler.jeus.trace.packages
@@ -113,10 +112,7 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
     private void addPackageBasedTransform(List<String> packages) {
         logger.info("[JEUS-PLUGIN] Package-based transform enabled for: " + packages);
 
-        // 패키지 기반 Matcher 생성
         Matcher packageMatcher = Matchers.newPackageBasedMatcher(packages);
-
-        // 패키지 하위 모든 클래스에 트랜스폼 적용
         transformTemplate.transform(packageMatcher, HimedClassTransformCallback.class);
 
         logger.info("[JEUS-PLUGIN] Package-based method tracing registered for packages: " + packages);
@@ -150,21 +146,9 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
     /**
      * himed 클래스 Transform Callback - public 메서드에 인터셉터 추가
      * Impl 클래스만 필터링하여 처리
-     *
-     * [핫 디플로이 레지스트리 성장 방지]
-     * - 클래스명 기반으로 메서드 시그니처 → 인터셉터 ID 매핑을 static으로 관리
-     *   (static이므로 ClassLoader 교체와 무관하게 JVM 종료 시까지 유지)
-     * - 핫 디플로이 시 기존 메서드는 addInterceptor(existingId)로 ID 재사용
-     *   → 새 바이트코드에도 기존 ID가 주입됨 (레지스트리 증가 없음, 트레이싱 유지)
-     * - 핫 디플로이로 새로 추가된 메서드만 신규 ID 할당
      */
     public static class HimedClassTransformCallback implements TransformCallback {
         private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
-
-        // ─── 핵심: static 선언으로 모든 ClassLoader 에서 공유 ───
-        // className → (메서드 시그니처 → 인터셉터 ID)
-        private static final ConcurrentHashMap<String, ConcurrentHashMap<String, Integer>> classMethodIdMap =
-                new ConcurrentHashMap<String, ConcurrentHashMap<String, Integer>>();
 
         @Override
         public byte[] doInTransform(Instrumentor instrumentor, ClassLoader classLoader, String className,
@@ -180,26 +164,9 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 return null;
             }
 
-            // ─── 핫 디플로이 감지 ───
-            ConcurrentHashMap<String, Integer> existingMethodIds = classMethodIdMap.get(className);
-            boolean isHotDeploy = (existingMethodIds != null);
-
-            if (isHotDeploy) {
-                logger.warn("[JEUS-PLUGIN] ★ Hot-deploy detected: " + className
-                        + " | Reusing " + existingMethodIds.size() + " existing interceptor IDs");
-            } else if (logger.isInfoEnabled()) {
-                logger.info("[JEUS-PLUGIN] Transforming class: " + className);
-            }
-
-            ConcurrentHashMap<String, Integer> methodIds = isHotDeploy
-                    ? existingMethodIds
-                    : new ConcurrentHashMap<String, Integer>();
-
             List<InstrumentMethod> methods = target.getDeclaredMethods(MethodFilters.modifier(Modifier.PUBLIC));
 
-            int reusedCount = 0;
             int addedCount = 0;
-
             for (InstrumentMethod method : methods) {
                 String methodName = method.getName();
 
@@ -207,65 +174,18 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                     continue;
                 }
 
-                String sig = buildMethodSig(method);
-
-                if (isHotDeploy && existingMethodIds.containsKey(sig)) {
-                    // ─── 핫 디플로이: 기존 ID 재사용 ───
-                    // addInterceptor(int id): 새 인터셉터 인스턴스 생성 없이
-                    // 기존 레지스트리 ID를 새 바이트코드에 주입
-                    // → 레지스트리 증가 없음, 트레이싱 정상 유지
-                    int existingId = existingMethodIds.get(sig);
-                    try {
-                        method.addInterceptor(existingId);
-                        reusedCount++;
-                    } catch (Exception e) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("[JEUS-PLUGIN] Failed to reuse interceptor id=" + existingId
-                                    + " for " + className + "." + methodName, e);
-                        }
-                    }
-                } else {
-                    // ─── 최초 로드 또는 핫 디플로이로 새로 추가된 메서드 ───
-                    try {
-                        int newId = method.addInterceptor(HimedMethodInterceptor.class);
-                        methodIds.put(sig, newId);
-                        addedCount++;
-                    } catch (Exception e) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("[JEUS-PLUGIN] Failed to add interceptor to "
-                                    + className + "." + methodName, e);
-                        }
-                    }
+                try {
+                    method.addInterceptor(HimedMethodInterceptor.class);
+                    addedCount++;
+                } catch (Exception e) {
+                    logger.warn("[JEUS-PLUGIN] Failed to add interceptor to "
+                            + className + "." + methodName + ": " + e.getMessage());
                 }
             }
 
-            if (!isHotDeploy) {
-                classMethodIdMap.put(className, methodIds);
-            }
-
-            logger.info("[JEUS-PLUGIN] " + className
-                    + ": new_ids=" + addedCount
-                    + ", reused_ids=" + reusedCount
-                    + " [hot-deploy=" + isHotDeploy + "]");
+            logger.info("[JEUS-PLUGIN] Transforming class: " + className + " | added=" + addedCount);
 
             return target.toBytecode();
-        }
-
-        /**
-         * 메서드 고유 식별자: 이름 + 파라미터 타입 목록
-         * ex) "doSomething(java.lang.String,int)"
-         */
-        private static String buildMethodSig(InstrumentMethod method) {
-            String[] paramTypes = method.getParameterTypes();
-            if (paramTypes == null || paramTypes.length == 0) {
-                return method.getName() + "()";
-            }
-            StringBuilder sb = new StringBuilder(method.getName()).append('(');
-            for (int i = 0; i < paramTypes.length; i++) {
-                if (i > 0) sb.append(',');
-                sb.append(paramTypes[i]);
-            }
-            return sb.append(')').toString();
         }
 
         private static boolean isExcludedMethod(String methodName) {
@@ -301,8 +221,6 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
 
                 InstrumentClass target = instrumentor.getInstrumentClass(classLoader, className, classfileBuffer);
 
-                // getConnection 메서드에 인터셉터 추가
-                // getConnection(String, String, boolean) 메서드 계측
                 InstrumentMethod getConnectionMethod = target.getDeclaredMethod("getConnection",
                         "java.lang.String", "java.lang.String", "boolean");
 
