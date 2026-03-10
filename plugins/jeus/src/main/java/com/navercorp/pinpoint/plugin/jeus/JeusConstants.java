@@ -9,7 +9,7 @@ public final class JeusConstants {
     }
 
     public static final ServiceType JEUS = ServiceTypeFactory.of(7010, "JEUS", "JEUS_METHOD",
-            ServiceTypeProperty.RECORD_STATISTICS, ServiceTypeProperty.INCLUDE_DESTINATION_ID);
+            ServiceTypeProperty.RECORD_STATISTICS);
     
     public static final ServiceType JEUS_METHOD = ServiceTypeFactory.of(7011, "JEUS_METHOD", "JEUS_METHOD");
     
