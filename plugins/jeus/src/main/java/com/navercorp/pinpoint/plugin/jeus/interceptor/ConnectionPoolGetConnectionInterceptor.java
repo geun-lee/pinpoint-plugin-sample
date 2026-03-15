@@ -6,7 +6,9 @@ import com.navercorp.pinpoint.bootstrap.logging.PLoggerFactory;
 import com.navercorp.pinpoint.bootstrap.plugin.monitor.DataSourceMonitorRegistry;
 import com.navercorp.pinpoint.plugin.jeus.datasource.JeusDataSourceMonitor;
 
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Collections;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class ConnectionPoolGetConnectionInterceptor implements AroundInterceptor {
@@ -14,15 +16,22 @@ public class ConnectionPoolGetConnectionInterceptor implements AroundInterceptor
     private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
 
     // 모니터 객체를 여기에 저장해두어야 GC가 되지 않고 계속 살아있습니다.
-    private static final ConcurrentHashMap<Object, JeusDataSourceMonitor> registeredMonitors = new ConcurrentHashMap<Object, JeusDataSourceMonitor>();
+    // ConcurrentHashMap 유지: DataSourceMonitorRegistry가 WeakReference로 저장할 경우 GC 보호 필요
+    // (핫 디플로이 시 ConnectionPool 인스턴스가 교체되므로 새 인스턴스는 새 항목으로 자동 등록됨)
+    private static final Map<Object, JeusDataSourceMonitor> registeredMonitors =
+            Collections.synchronizedMap(new java.util.IdentityHashMap<Object, JeusDataSourceMonitor>());
 
     // 등록 실패 횟수 추적 (재시도 제한용)
-    private static final ConcurrentHashMap<Object, AtomicInteger> failedAttempts = new ConcurrentHashMap<Object, AtomicInteger>();
+    // WeakHashMap: ConnectionPool 인스턴스가 GC되면 자동 제거 → 메모리 누수 방지
+    private static final Map<Object, AtomicInteger> failedAttempts =
+            Collections.synchronizedMap(new WeakHashMap<Object, AtomicInteger>());
     private static final int MAX_RETRY_ATTEMPTS = 3;
 
     // 등록 진행 중 표시 (중복 등록 방지)
+    // WeakHashMap: ConnectionPool 인스턴스가 GC되면 자동 제거 → 메모리 누수 방지
     private static final Object REGISTERING_MARKER = new Object();
-    private static final ConcurrentHashMap<Object, Object> registeringTargets = new ConcurrentHashMap<Object, Object>();
+    private static final Map<Object, Object> registeringTargets =
+            Collections.synchronizedMap(new WeakHashMap<Object, Object>());
 
     private final DataSourceMonitorRegistry dataSourceMonitorRegistry;
 
@@ -47,9 +56,13 @@ public class ConnectionPoolGetConnectionInterceptor implements AroundInterceptor
             return;
         }
 
-        // 다른 스레드에서 이미 등록 중이면 스킵 (lock-free)
-        if (registeringTargets.putIfAbsent(target, REGISTERING_MARKER) != null) {
-            return;
+        // 다른 스레드에서 이미 등록 중이면 스킵
+        // WeakHashMap은 putIfAbsent 미지원 → synchronized 블록으로 원자성 보장
+        synchronized (registeringTargets) {
+            if (registeringTargets.containsKey(target)) {
+                return;
+            }
+            registeringTargets.put(target, REGISTERING_MARKER);
         }
 
         try {
@@ -92,15 +105,15 @@ public class ConnectionPoolGetConnectionInterceptor implements AroundInterceptor
     }
 
     private int incrementFailedAttempts(Object target) {
-        AtomicInteger counter = failedAttempts.get(target);
-        if (counter == null) {
-            counter = new AtomicInteger(0);
-            AtomicInteger existing = failedAttempts.putIfAbsent(target, counter);
-            if (existing != null) {
-                counter = existing;
+        // WeakHashMap은 putIfAbsent 미지원 → synchronized 블록으로 원자성 보장
+        synchronized (failedAttempts) {
+            AtomicInteger counter = failedAttempts.get(target);
+            if (counter == null) {
+                counter = new AtomicInteger(0);
+                failedAttempts.put(target, counter);
             }
+            return counter.incrementAndGet();
         }
-        return counter.incrementAndGet();
     }
 
     @Override

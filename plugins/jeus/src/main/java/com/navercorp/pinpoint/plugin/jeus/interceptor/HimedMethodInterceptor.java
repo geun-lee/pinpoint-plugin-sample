@@ -34,31 +34,31 @@ public class HimedMethodInterceptor implements AroundInterceptor {
     public void before(Object target, Object[] args) {
         Trace trace = traceContext.currentTraceObject();
         if (trace == null) {
-            // [진단] trace가 null인 경우 → WebActionDispatcher가 trace를 생성했는지 확인 필요
-            logOnce(lastNullTraceLogTime,
-                    "[JEUS-PLUGIN][DIAG] HimedMethod.before: trace=NULL → thread=" + Thread.currentThread().getName()
-                    + " method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
+            // [진단] trace가 null인 경우 → 문자열은 실제 출력 시에만 생성 (GC 부담 최소화)
+            if (shouldLog(lastNullTraceLogTime)) {
+                logger.warn("[JEUS-PLUGIN][DIAG] HimedMethod.before: trace=NULL → thread=" + Thread.currentThread().getName()
+                        + " method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
+            }
             return;
         }
 
         if (!trace.canSampled()) {
             // [진단] trace는 있지만 샘플링 대상이 아닌 경우
-            logOnce(lastNotSampledLogTime,
-                    "[JEUS-PLUGIN][DIAG] HimedMethod.before: canSampled=false → thread=" + Thread.currentThread().getName()
-                    + " method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
+            if (shouldLog(lastNotSampledLogTime)) {
+                logger.warn("[JEUS-PLUGIN][DIAG] HimedMethod.before: canSampled=false → thread=" + Thread.currentThread().getName()
+                        + " method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
+            }
             return;
         }
 
         trace.traceBlockBegin();
     }
 
-    /** 마지막 로그 시각으로부터 DIAG_INTERVAL_MS 이상 경과한 경우에만 WARN 로그 출력 */
-    private void logOnce(AtomicLong lastLogTime, String message) {
+    /** DIAG_INTERVAL_MS 이상 경과한 경우에만 true 반환 (문자열 생성은 호출 측에서 담당) */
+    private boolean shouldLog(AtomicLong lastLogTime) {
         long now = System.currentTimeMillis();
         long last = lastLogTime.get();
-        if (now - last >= DIAG_INTERVAL_MS && lastLogTime.compareAndSet(last, now)) {
-            logger.warn(message);
-        }
+        return now - last >= DIAG_INTERVAL_MS && lastLogTime.compareAndSet(last, now);
     }
 
     @Override

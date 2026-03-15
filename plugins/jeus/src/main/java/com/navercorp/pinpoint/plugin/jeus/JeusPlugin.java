@@ -88,7 +88,7 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
 
         List<String> traceClasses = config.getJeusTraceClasses();
         if (traceClasses != null && !traceClasses.isEmpty()) {
-            addClassBasedTransform(traceClasses);
+            addClassBasedTransform(traceClasses, tracePackages);
         }
 
         if ((tracePackages == null || tracePackages.isEmpty()) &&
@@ -109,7 +109,7 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 + " superClass=kr.co.hit.live.context.ContextAwareService");
     }
 
-    private void addClassBasedTransform(List<String> classes) {
+    private void addClassBasedTransform(List<String> classes, List<String> existingPackages) {
         int registeredCount = 0;
         for (String className : classes) {
             String trimmed = className.trim();
@@ -121,6 +121,13 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 continue;
             }
 
+            // 패키지 기반 transform에서 이미 커버되는 클래스는 중복 등록 방지
+            // → 같은 클래스에 인터셉터가 두 번 추가되어 콜스택에 중복 표시되는 문제 예방
+            if (isCoveredByPackage(trimmed, existingPackages)) {
+                logger.info("[JEUS-PLUGIN] Skipping class-based transform (covered by package): " + trimmed);
+                continue;
+            }
+
             transformTemplate.transform(trimmed, HimedClassTransformCallback.class);
             registeredCount++;
         }
@@ -128,6 +135,27 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
         if (registeredCount > 0) {
             logger.info("[JEUS-PLUGIN] Class-based method tracing registered for " + registeredCount + " classes");
         }
+    }
+
+    /**
+     * 주어진 클래스명이 패키지 목록 중 하나에 포함되는지 확인.
+     * (예: himed.his.foo.BarService → himed.his 패키지에 포함됨)
+     */
+    private boolean isCoveredByPackage(String className, List<String> packages) {
+        if (packages == null || packages.isEmpty()) {
+            return false;
+        }
+        for (String pkg : packages) {
+            String trimmedPkg = pkg.trim();
+            if (trimmedPkg.isEmpty()) {
+                continue;
+            }
+            // className이 패키지 하위에 속하는지 prefix로 확인
+            if (className.startsWith(trimmedPkg + ".")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

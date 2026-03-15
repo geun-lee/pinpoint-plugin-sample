@@ -15,16 +15,29 @@ import com.navercorp.pinpoint.plugin.jeus.JeusConfigurationHolder;
 import com.navercorp.pinpoint.plugin.jeus.JeusConstants;
 
 import java.lang.reflect.Method;
+import java.util.Collections;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.WeakHashMap;
 
 public class WebActionDispatcherServiceInterceptor implements AroundInterceptor {
     private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
     private final TraceContext traceContext;
     private final MethodDescriptor descriptor;
 
-    // ClassLoader별 Method 캐싱 (멀티 ClassLoader 환경 대응)
-    private static final Map<Class<?>, MethodCache> methodCacheMap = new ConcurrentHashMap<Class<?>, MethodCache>();
+    // ClassLoader별 Request Method 캐싱
+    // WeakHashMap: 핫 디플로이 시 이전 ClassLoader의 Class<?> 객체가 GC될 수 있도록 weak key 사용
+    // → ConcurrentHashMap의 strong key는 이전 ClassLoader 전체를 Metaspace에 고정시키는 누수를 유발
+    private static final Map<Class<?>, MethodCache> methodCacheMap =
+            Collections.synchronizedMap(new WeakHashMap<Class<?>, MethodCache>());
+
+    // Response.getStatus() 캐시 (WeakHashMap으로 ClassLoader 누수 방지)
+    private static final Map<Class<?>, Method> statusMethodCache =
+            Collections.synchronizedMap(new WeakHashMap<Class<?>, Method>());
+
+    // recordUriTemplate 지원 방식 캐시 (Pinpoint 버전마다 위치 다름)
+    // 0: 미확인, 1: Trace에서 지원, 2: SpanRecorder에서 지원, 3: 미지원
+    private static volatile int uriTemplateMode = 0;
+    private static volatile Method uriTemplateMethod = null;
 
     private static final String ATTR_REQUEST_URI = "pinpoint.jeus.requestUri";
     private static final String ATTR_SERVER_PORT = "pinpoint.jeus.serverPort";
@@ -299,10 +312,13 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
     private MethodCache getMethodCache(Class<?> clazz) {
         MethodCache cache = methodCacheMap.get(clazz);
         if (cache == null) {
-            cache = new MethodCache(clazz);
-            MethodCache existing = methodCacheMap.putIfAbsent(clazz, cache);
-            if (existing != null) {
-                cache = existing;
+            // WeakHashMap은 putIfAbsent 미지원 → synchronized 블록으로 원자성 보장
+            synchronized (methodCacheMap) {
+                cache = methodCacheMap.get(clazz);
+                if (cache == null) {
+                    cache = new MethodCache(clazz);
+                    methodCacheMap.put(clazz, cache);
+                }
             }
         }
         return cache;
@@ -396,7 +412,21 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
     private int getStatus(Object response) {
         if (response == null) return 0;
         try {
-            Method method = response.getClass().getMethod("getStatus");
+            Class<?> clazz = response.getClass();
+            Method method = statusMethodCache.get(clazz);
+            if (method == null) {
+                synchronized (statusMethodCache) {
+                    method = statusMethodCache.get(clazz);
+                    if (method == null) {
+                        try {
+                            method = clazz.getMethod("getStatus");
+                        } catch (Exception e) {
+                            return 0;
+                        }
+                        statusMethodCache.put(clazz, method);
+                    }
+                }
+            }
             Object result = method.invoke(response);
             return result instanceof Integer ? (Integer) result : 0;
         } catch (Exception e) {
@@ -405,17 +435,39 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
     }
 
     private void recordUriTemplate(Trace trace, String uriTemplate) {
-        try {
-            Method method = trace.getClass().getMethod("recordUriTemplate", String.class);
-            method.invoke(trace, uriTemplate);
-        } catch (Exception e) {
-            try {
-                SpanRecorder spanRecorder = trace.getSpanRecorder();
-                Method method = spanRecorder.getClass().getMethod("recordUriTemplate", String.class);
-                method.invoke(spanRecorder, uriTemplate);
-            } catch (Exception ex) {
-                // ignore - Pinpoint 버전에 따라 미지원
+        // 최초 1회만 탐색 후 mode에 캐싱 (이후 호출에서 getMethod() 생략)
+        int mode = uriTemplateMode;
+        if (mode == 0) {
+            synchronized (WebActionDispatcherServiceInterceptor.class) {
+                mode = uriTemplateMode;
+                if (mode == 0) {
+                    try {
+                        uriTemplateMethod = trace.getClass().getMethod("recordUriTemplate", String.class);
+                        uriTemplateMode = 1;
+                        mode = 1;
+                    } catch (Exception e) {
+                        try {
+                            SpanRecorder sr = trace.getSpanRecorder();
+                            uriTemplateMethod = sr.getClass().getMethod("recordUriTemplate", String.class);
+                            uriTemplateMode = 2;
+                            mode = 2;
+                        } catch (Exception ex) {
+                            uriTemplateMode = 3; // 미지원
+                            mode = 3;
+                        }
+                    }
+                }
             }
+        }
+        if (mode == 3) return;
+        try {
+            if (mode == 1) {
+                uriTemplateMethod.invoke(trace, uriTemplate);
+            } else if (mode == 2) {
+                uriTemplateMethod.invoke(trace.getSpanRecorder(), uriTemplate);
+            }
+        } catch (Exception e) {
+            // ignore - Pinpoint 버전에 따라 미지원
         }
     }
 }

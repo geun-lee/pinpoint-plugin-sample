@@ -2,10 +2,9 @@ package com.navercorp.pinpoint.plugin.jeus;
 
 import com.navercorp.pinpoint.bootstrap.config.ProfilerConfig;
 
+import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 public class JeusConfiguration {
     private final boolean jeusEnabled;
@@ -90,29 +89,48 @@ public class JeusConfiguration {
     }
 
     public static class ExcludeUrlFilter {
-        private final Set<String> excludeUrls;
+        // List 사용: prefix 매칭을 위해 순회 필요 (URL 제외 목록은 통상 소수)
+        private final List<String> excludeUrls;
 
         public ExcludeUrlFilter(String excludeUrl) {
             if (excludeUrl == null || excludeUrl.isEmpty()) {
-                this.excludeUrls = Collections.emptySet();
+                this.excludeUrls = Collections.emptyList();
                 return;
             }
-            
-            this.excludeUrls = new HashSet<String>();
-            String[] urls = excludeUrl.split(",");
-            for (String url : urls) {
+
+            List<String> urls = new ArrayList<String>();
+            String[] split = excludeUrl.split(",");
+            for (String url : split) {
                 String trimmed = url.trim();
                 if (!trimmed.isEmpty()) {
-                    this.excludeUrls.add(trimmed);
+                    urls.add(trimmed);
                 }
             }
+            this.excludeUrls = Collections.unmodifiableList(urls);
         }
 
+        /**
+         * URL 필터링.
+         * - 완전 일치: /health
+         * - Prefix 일치: /health/ → /health/check 도 제외
+         * - 쿼리 파라미터 무시: /health 설정 시 /health?foo=bar 도 제외
+         */
         public boolean filter(String value) {
             if (value == null) {
                 return false;
             }
-            return excludeUrls.contains(value);
+            // 쿼리 파라미터 제거 후 비교
+            String path = value;
+            int queryIdx = value.indexOf('?');
+            if (queryIdx >= 0) {
+                path = value.substring(0, queryIdx);
+            }
+            for (String excludeUrl : excludeUrls) {
+                if (path.equals(excludeUrl) || path.startsWith(excludeUrl)) {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 }
