@@ -75,7 +75,18 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             }
         }
 
-        return traceContext.newTraceObject();
+        // DisableTrace는 currentRawTraceObject()로 감지되지 않는 버전이 있어,
+        // newTraceObject() 호출 전 factory 내부 스토리지를 강제 정리한다.
+        traceContext.removeTraceObject();
+
+        try {
+            return traceContext.newTraceObject();
+        } catch (Exception e) {
+            if (logger.isWarnEnabled()) {
+                logger.warn("[JEUS-PLUGIN] newTraceObject failed, request will not be traced. error=" + e.getMessage());
+            }
+            return null;
+        }
     }
 
     @Override
@@ -84,7 +95,7 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             return;
         }
 
-        Trace staleTrace = traceContext.currentTraceObject();
+        Trace staleTrace = traceContext.currentRawTraceObject();
         if (staleTrace != null) {
             logger.warn("[JEUS-PLUGIN] Stale trace detected at request start. Force removing.");
             try {
@@ -109,67 +120,82 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             return;
         }
 
-        if (trace.canSampled()) {
-            try {
-                // 루트 Span 데이터 기록 (SpanRecorder)
-                SpanRecorder spanRecorder = trace.getSpanRecorder();
-                spanRecorder.recordServiceType(JeusConstants.JEUS);
-                spanRecorder.recordApi(descriptor);
-                spanRecorder.recordRpcName(requestURI != null ? requestURI : "/");
+        boolean blockBegan = false;
+        try {
+            if (trace.canSampled()) {
+                try {
+                    // 루트 Span 데이터 기록 (SpanRecorder)
+                    SpanRecorder spanRecorder = trace.getSpanRecorder();
+                    spanRecorder.recordServiceType(JeusConstants.JEUS);
+                    spanRecorder.recordApi(descriptor);
+                    spanRecorder.recordRpcName(requestURI != null ? requestURI : "/");
 
-                String serverName = invokeStringMethod(cache.getServerName, request);
-                int serverPort = invokeIntMethod(cache.getServerPort, request, 80);
+                    String serverName = invokeStringMethod(cache.getServerName, request);
+                    int serverPort = invokeIntMethod(cache.getServerPort, request, 80);
 
-                StringBuilder sb = new StringBuilder(64);
-                sb.append(serverName != null ? serverName : "").append(':').append(serverPort);
-                spanRecorder.recordEndPoint(sb.toString());
-                spanRecorder.recordRemoteAddress(invokeStringMethod(cache.getRemoteAddr, request));
+                    StringBuilder sb = new StringBuilder(64);
+                    sb.append(serverName != null ? serverName : "").append(':').append(serverPort);
+                    spanRecorder.recordEndPoint(sb.toString());
+                    spanRecorder.recordRemoteAddress(invokeStringMethod(cache.getRemoteAddr, request));
 
-                // AcceptorHost: Host 헤더 우선, 없으면 localName:port
-                String hostHeader = invokeStringMethodWithParam(cache.getHeader, request, "Host");
-                String acceptorHost;
-                if (hostHeader != null && !hostHeader.isEmpty()) {
-                    acceptorHost = hostHeader;
-                } else {
-                    sb.setLength(0);
-                    sb.append(invokeStringMethod(cache.getLocalName, request)).append(':').append(serverPort);
-                    acceptorHost = sb.toString();
-                }
-                spanRecorder.recordAcceptorHost(acceptorHost);
+                    // AcceptorHost: Host 헤더 우선, 없으면 localName:port
+                    String hostHeader = invokeStringMethodWithParam(cache.getHeader, request, "Host");
+                    String acceptorHost;
+                    if (hostHeader != null && !hostHeader.isEmpty()) {
+                        acceptorHost = hostHeader;
+                    } else {
+                        sb.setLength(0);
+                        sb.append(invokeStringMethod(cache.getLocalName, request)).append(':').append(serverPort);
+                        acceptorHost = sb.toString();
+                    }
+                    spanRecorder.recordAcceptorHost(acceptorHost);
 
-                // 부모 앱 정보 (분산 트레이싱에서 continueTraceObject인 경우 표시)
-                String parentAppName = invokeStringMethodWithParam(cache.getHeader, request, "Pinpoint-pAppName");
-                String parentAppTypeStr = invokeStringMethodWithParam(cache.getHeader, request, "Pinpoint-pAppType");
-                if (parentAppName != null && !parentAppName.isEmpty() && parentAppTypeStr != null) {
-                    try {
-                        spanRecorder.recordParentApplication(parentAppName, Short.parseShort(parentAppTypeStr));
-                    } catch (NumberFormatException ignore) {
-                        // ignore malformed header
+                    // 부모 앱 정보 (분산 트레이싱에서 continueTraceObject인 경우 표시)
+                    String parentAppName = invokeStringMethodWithParam(cache.getHeader, request, "Pinpoint-pAppName");
+                    String parentAppTypeStr = invokeStringMethodWithParam(cache.getHeader, request, "Pinpoint-pAppType");
+                    if (parentAppName != null && !parentAppName.isEmpty() && parentAppTypeStr != null) {
+                        try {
+                            spanRecorder.recordParentApplication(parentAppName, Short.parseShort(parentAppTypeStr));
+                        } catch (NumberFormatException ignore) {
+                            // ignore malformed header
+                        }
+                    }
+
+                    // after()에서 재사용하기 위해 request attribute에 캐싱
+                    invokeSetAttribute(cache.setAttribute, request, ATTR_REQUEST_URI, requestURI);
+                    invokeSetAttribute(cache.setAttribute, request, ATTR_SERVER_PORT, serverPort);
+
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("[JEUS-PLUGIN] AcceptorHost: " + acceptorHost);
+                    }
+                } catch (Throwable t) {
+                    if (logger.isWarnEnabled()) {
+                        logger.warn("[JEUS-PLUGIN] BEFORE. Caused: " + t.getMessage(), t);
                     }
                 }
-
-                // after()에서 재사용하기 위해 request attribute에 캐싱
-                invokeSetAttribute(cache.setAttribute, request, ATTR_REQUEST_URI, requestURI);
-                invokeSetAttribute(cache.setAttribute, request, ATTR_SERVER_PORT, serverPort);
-
-                if (logger.isDebugEnabled()) {
-                    logger.debug("[JEUS-PLUGIN] AcceptorHost: " + acceptorHost);
-                }
-            } catch (Throwable t) {
-                if (logger.isWarnEnabled()) {
-                    logger.warn("[JEUS-PLUGIN] BEFORE. Caused: " + t.getMessage(), t);
-                }
             }
-        }
 
-        // traceBlockBegin은 canSampled 여부와 무관하게 항상 호출
-        // → after()의 traceBlockEnd와 쌍을 맞춤
-        trace.traceBlockBegin();
+            // traceBlockBegin은 canSampled 여부와 무관하게 항상 호출
+            // → after()의 traceBlockEnd와 쌍을 맞춤
+            trace.traceBlockBegin();
+            blockBegan = true;
+        } catch (Throwable t) {
+            // traceBlockBegin() 실패 시 after()에서 traceBlockEnd 쌍 불일치를 막기 위해
+            // 여기서 직접 trace를 정리한다.
+            if (logger.isWarnEnabled()) {
+                logger.warn("[JEUS-PLUGIN] BEFORE setup failed, cleaning up trace. Caused: " + t.getMessage(), t);
+            }
+            try {
+                trace.close();
+            } catch (Throwable ignore) {
+            }
+            traceContext.removeTraceObject();
+        }
     }
 
     @Override
     public void after(Object target, Object[] args, Object result, Throwable throwable) {
-        Trace trace = traceContext.currentTraceObject();
+        Trace trace = traceContext.currentRawTraceObject();
         if (trace == null) {
             return;
         }
