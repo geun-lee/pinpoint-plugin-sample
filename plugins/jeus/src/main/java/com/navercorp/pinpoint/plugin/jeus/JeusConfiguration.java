@@ -8,11 +8,9 @@ import java.util.List;
 
 public class JeusConfiguration {
     private final boolean jeusEnabled;
-    private final List<String> jeusBootstrapMains;
     private final ExcludeUrlFilter jeusExcludeUrlFilter;
     private final boolean jeusTraceRequestParam;
-    private final boolean jeusHidePinpointHeader;
-    
+
     // DataSource 모니터링 설정
     private final boolean jeusDataSourceEnabled;
 
@@ -28,13 +26,11 @@ public class JeusConfiguration {
 
     public JeusConfiguration(ProfilerConfig config) {
         this.jeusEnabled = config.readBoolean("profiler.jeus.enable", true);
-        this.jeusBootstrapMains = config.readList("profiler.jeus.bootstrap.main");
-        
+
         String excludeUrl = config.readString("profiler.jeus.excludeurl", "");
         this.jeusExcludeUrlFilter = new ExcludeUrlFilter(excludeUrl);
-        
+
         this.jeusTraceRequestParam = config.readBoolean("profiler.jeus.trace.requestparam", true);
-        this.jeusHidePinpointHeader = config.readBoolean("profiler.jeus.hidepinpointheader", true);
         
         // DataSource 모니터링 설정
         this.jeusDataSourceEnabled = config.readBoolean("profiler.jeus.datasource.enable", true);
@@ -52,10 +48,6 @@ public class JeusConfiguration {
         return jeusEnabled;
     }
 
-    public List<String> getJeusBootstrapMains() {
-        return jeusBootstrapMains;
-    }
-
     public ExcludeUrlFilter getJeusExcludeUrlFilter() {
         return jeusExcludeUrlFilter;
     }
@@ -64,10 +56,6 @@ public class JeusConfiguration {
         return jeusTraceRequestParam;
     }
 
-    public boolean isJeusHidePinpointHeader() {
-        return jeusHidePinpointHeader;
-    }
-    
     public boolean isJeusDataSourceEnabled() {
         return jeusDataSourceEnabled;
     }
@@ -89,31 +77,40 @@ public class JeusConfiguration {
     }
 
     public static class ExcludeUrlFilter {
-        // List 사용: prefix 매칭을 위해 순회 필요 (URL 제외 목록은 통상 소수)
+        // 완전 일치용 URL 목록과 prefix 매칭용 목록을 분리하여 생성자에서 미리 계산
         private final List<String> excludeUrls;
+        // prefix 매칭용: 슬래시로 끝나도록 미리 정규화 (매 요청마다 문자열 concat 방지)
+        private final List<String> excludePrefixes;
 
         public ExcludeUrlFilter(String excludeUrl) {
             if (excludeUrl == null || excludeUrl.isEmpty()) {
                 this.excludeUrls = Collections.emptyList();
+                this.excludePrefixes = Collections.emptyList();
                 return;
             }
 
             List<String> urls = new ArrayList<String>();
+            List<String> prefixes = new ArrayList<String>();
             String[] split = excludeUrl.split(",");
             for (String url : split) {
                 String trimmed = url.trim();
                 if (!trimmed.isEmpty()) {
                     urls.add(trimmed);
+                    prefixes.add(trimmed.endsWith("/") ? trimmed : trimmed + "/");
                 }
             }
             this.excludeUrls = Collections.unmodifiableList(urls);
+            this.excludePrefixes = Collections.unmodifiableList(prefixes);
         }
 
         /**
          * URL 필터링.
-         * - 완전 일치: /health
-         * - Prefix 일치: /health/ → /health/check 도 제외
-         * - 쿼리 파라미터 무시: /health 설정 시 /health?foo=bar 도 제외
+         * - 완전 일치: /health → /health, /health?foo=bar 제외
+         * - Prefix 일치: /health/ → /health/check 제외 (슬래시 경계 기준)
+         * - 쿼리 파라미터 무시: path 부분만 비교
+         *
+         * 주의: /health 설정은 /healthcheck를 제외하지 않음 (슬래시 경계 준수)
+         *       /healthcheck도 제외하려면 /health/ 로 설정할 것
          */
         public boolean filter(String value) {
             if (value == null) {
@@ -125,8 +122,13 @@ public class JeusConfiguration {
             if (queryIdx >= 0) {
                 path = value.substring(0, queryIdx);
             }
-            for (String excludeUrl : excludeUrls) {
-                if (path.equals(excludeUrl) || path.startsWith(excludeUrl)) {
+            for (int i = 0; i < excludeUrls.size(); i++) {
+                if (path.equals(excludeUrls.get(i))) {
+                    return true;
+                }
+                // 슬래시 경계 기준 prefix 일치: /health 설정 시 /health/check 도 제외,
+                // 단 /healthcheck 는 제외하지 않음
+                if (path.startsWith(excludePrefixes.get(i))) {
                     return true;
                 }
             }

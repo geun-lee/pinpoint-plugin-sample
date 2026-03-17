@@ -20,9 +20,13 @@ import com.navercorp.pinpoint.plugin.jeus.interceptor.HimedMethodInterceptor;
 import com.navercorp.pinpoint.plugin.jeus.interceptor.LoggingAppenderInterceptor;
 import com.navercorp.pinpoint.plugin.jeus.interceptor.WebActionDispatcherServiceInterceptor;
 
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Modifier;
 import java.security.ProtectionDomain;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAware {
@@ -88,7 +92,7 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
 
         List<String> traceClasses = config.getJeusTraceClasses();
         if (traceClasses != null && !traceClasses.isEmpty()) {
-            addClassBasedTransform(traceClasses, tracePackages);
+            addClassBasedTransform(traceClasses);
         }
 
         if ((tracePackages == null || tracePackages.isEmpty()) &&
@@ -109,7 +113,7 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 + " superClass=kr.co.hit.live.context.ContextAwareService");
     }
 
-    private void addClassBasedTransform(List<String> classes, List<String> existingPackages) {
+    private void addClassBasedTransform(List<String> classes) {
         int registeredCount = 0;
         for (String className : classes) {
             String trimmed = className.trim();
@@ -121,13 +125,10 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 continue;
             }
 
-            // 패키지 기반 transform에서 이미 커버되는 클래스는 중복 등록 방지
-            // → 같은 클래스에 인터셉터가 두 번 추가되어 콜스택에 중복 표시되는 문제 예방
-            if (isCoveredByPackage(trimmed, existingPackages)) {
-                logger.info("[JEUS-PLUGIN] Skipping class-based transform (covered by package): " + trimmed);
-                continue;
-            }
-
+            // 패키지 기반 transform과 중복 등록을 허용함.
+            // 이중 계측 방지는 HimedClassTransformCallback 내부에서 ClassLoader 기준으로 처리.
+            // (패키지 transform의 SuperClass 매처를 통과하지 못하는 클래스를 traceClasses에서
+            //  명시적으로 지정한 경우, 이전 isCoveredByPackage 방식으로는 계측이 누락되는 문제 수정)
             transformTemplate.transform(trimmed, HimedClassTransformCallback.class);
             registeredCount++;
         }
@@ -135,27 +136,6 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
         if (registeredCount > 0) {
             logger.info("[JEUS-PLUGIN] Class-based method tracing registered for " + registeredCount + " classes");
         }
-    }
-
-    /**
-     * 주어진 클래스명이 패키지 목록 중 하나에 포함되는지 확인.
-     * (예: himed.his.foo.BarService → himed.his 패키지에 포함됨)
-     */
-    private boolean isCoveredByPackage(String className, List<String> packages) {
-        if (packages == null || packages.isEmpty()) {
-            return false;
-        }
-        for (String pkg : packages) {
-            String trimmedPkg = pkg.trim();
-            if (trimmedPkg.isEmpty()) {
-                continue;
-            }
-            // className이 패키지 하위에 속하는지 prefix로 확인
-            if (className.startsWith(trimmedPkg + ".")) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -169,14 +149,21 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
      * 따라서 핫 디플로이 시에도 새 ID를 발급하며, 레지스트리 고갈 방지를 위해
      * profiler.interceptor.registry.size 값을 충분히 크게 설정해야 함.
      * 권장값: profiler.interceptor.registry.size=1048576
+     *
+     * [이중 계측 방지]
+     * 같은 클래스가 패키지 기반 transform + 클래스 기반 transform 양쪽에 등록된 경우,
+     * Pinpoint는 두 콜백을 순서대로 호출함. WeakReference<ClassLoader> 추적으로
+     * 동일 ClassLoader 내 두 번째 호출을 감지하여 즉시 null을 반환(no-op).
+     * 새 ClassLoader(핫 디플로이)는 WeakReference가 만료되므로 정상 계측됨.
      */
     public static class HimedClassTransformCallback implements TransformCallback {
         private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
 
-        // 핫 디플로이 감지용: className → 이미 변환된 적 있는지 여부
-        // static: ClassLoader 교체(핫 디플로이) 후에도 JVM 종료 시까지 유지
-        private static final ConcurrentHashMap<String, Boolean> transformedClasses =
-                new ConcurrentHashMap<String, Boolean>();
+        // 이중 계측 방지 + 핫 디플로이 감지용: className → 마지막으로 계측한 ClassLoader(WeakRef)
+        // WeakReference: 핫 디플로이 시 이전 ClassLoader가 GC될 수 있도록 허용
+        // static: 패키지 transform/클래스 transform 양쪽 콜백 인스턴스가 공유해야 함
+        private static final ConcurrentHashMap<String, WeakReference<ClassLoader>> transformedClasses =
+                new ConcurrentHashMap<String, WeakReference<ClassLoader>>();
 
         @Override
         public byte[] doInTransform(Instrumentor instrumentor, ClassLoader classLoader, String className,
@@ -191,7 +178,27 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 return null;
             }
 
-            boolean isHotDeploy = transformedClasses.containsKey(className);
+            // 이중 계측 감지 / 핫 디플로이 감지
+            // putIfAbsent: get+put을 원자적으로 처리하여 TOCTOU 경쟁 조건 방지
+            WeakReference<ClassLoader> newRef = new WeakReference<ClassLoader>(classLoader);
+            WeakReference<ClassLoader> existingRef = transformedClasses.putIfAbsent(className, newRef);
+            boolean isHotDeploy = false;
+
+            if (existingRef != null) {
+                ClassLoader existingCl = existingRef.get();
+                if (existingCl == classLoader) {
+                    // 동일 ClassLoader에서 이미 계측됨 → 패키지+클래스 이중 등록에 의한 중복 호출
+                    // 두 번째 콜백은 아무것도 하지 않음 (null = 이전 transform 결과 그대로 사용)
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("[JEUS-PLUGIN] Skipping duplicate transform for: " + className);
+                    }
+                    return null;
+                }
+                // existingCl != classLoader (또는 GC됨) → 핫 디플로이로 새 ClassLoader 사용
+                // 새 ClassLoader ref로 교체 (putIfAbsent는 이미 존재하는 경우 교체 안 하므로 명시적 put)
+                transformedClasses.put(className, newRef);
+                isHotDeploy = true;
+            }
 
             if (isHotDeploy) {
                 logger.warn("[JEUS-PLUGIN] Hot-deploy detected: " + className + " | Re-transforming with new IDs");
@@ -219,8 +226,6 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 }
             }
 
-            transformedClasses.put(className, Boolean.TRUE);
-
             logger.info("[JEUS-PLUGIN] " + className
                     + ": added=" + addedCount
                     + " [hot-deploy=" + isHotDeploy + "]");
@@ -228,18 +233,19 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
             return target.toBytecode();
         }
 
+        // 제외 대상 메서드 이름: O(1) lookup
+        private static final Set<String> EXCLUDED_METHODS = new HashSet<String>(Arrays.asList(
+                "toString", "hashCode", "equals", "clone", "finalize", "getClass",
+                "<init>", "<clinit>", "init", "destroy"
+        ));
+
         private static boolean isExcludedMethod(String methodName) {
-            if (methodName.equals("toString") || methodName.equals("hashCode") ||
-                methodName.equals("equals") || methodName.equals("clone") ||
-                methodName.equals("finalize") || methodName.equals("getClass")) {
+            if (EXCLUDED_METHODS.contains(methodName)) {
                 return true;
             }
+            // getter/setter/is-accessor 제외 (prefix 매칭)
             if (methodName.startsWith("get") || methodName.startsWith("set") ||
                 methodName.startsWith("is")) {
-                return true;
-            }
-            if (methodName.equals("<init>") || methodName.equals("<clinit>") ||
-                methodName.equals("init") || methodName.equals("destroy")) {
                 return true;
             }
             return false;

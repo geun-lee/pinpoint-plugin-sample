@@ -15,9 +15,7 @@ import com.navercorp.pinpoint.plugin.jeus.JeusConfigurationHolder;
 import com.navercorp.pinpoint.plugin.jeus.JeusConstants;
 
 import java.lang.reflect.Method;
-import java.util.Collections;
-import java.util.Map;
-import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class WebActionDispatcherServiceInterceptor implements AroundInterceptor {
     private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
@@ -25,14 +23,18 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
     private final MethodDescriptor descriptor;
 
     // ClassLoader별 Request Method 캐싱
-    // WeakHashMap: 핫 디플로이 시 이전 ClassLoader의 Class<?> 객체가 GC될 수 있도록 weak key 사용
-    // → ConcurrentHashMap의 strong key는 이전 ClassLoader 전체를 Metaspace에 고정시키는 누수를 유발
-    private static final Map<Class<?>, MethodCache> methodCacheMap =
-            Collections.synchronizedMap(new WeakHashMap<Class<?>, MethodCache>());
+    // ConcurrentHashMap: lock-free read로 요청 hot path 경합 제거
+    // → Request/Response 클래스는 JEUS WAS 클래스로더 소속으로 서버 생애 동안 유지되므로 strong key 안전
+    private static final ConcurrentHashMap<Class<?>, MethodCache> methodCacheMap =
+            new ConcurrentHashMap<Class<?>, MethodCache>();
 
-    // Response.getStatus() 캐시 (WeakHashMap으로 ClassLoader 누수 방지)
-    private static final Map<Class<?>, Method> statusMethodCache =
-            Collections.synchronizedMap(new WeakHashMap<Class<?>, Method>());
+    // Response.getStatus() 캐시
+    private static final ConcurrentHashMap<Class<?>, Method> statusMethodCache =
+            new ConcurrentHashMap<Class<?>, Method>();
+
+    // 재진입 감지: 동일 스레드에서 WebActionDispatcher.service()가 중첩 호출될 때
+    // 첫 번째 trace를 stale로 잘못 인식하여 강제 close하는 것을 방지
+    private static final ThreadLocal<int[]> dispatchDepth = new ThreadLocal<int[]>();
 
     // recordUriTemplate 지원 방식 캐시 (Pinpoint 버전마다 위치 다름)
     // 0: 미확인, 1: Trace에서 지원, 2: SpanRecorder에서 지원, 3: 미지원
@@ -95,6 +97,7 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         try {
             return traceContext.newTraceObject();
         } catch (Exception e) {
+            traceContext.removeTraceObject();
             if (logger.isWarnEnabled()) {
                 logger.warn("[JEUS-PLUGIN] newTraceObject failed, request will not be traced. error=" + e.getMessage());
             }
@@ -108,8 +111,39 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             return;
         }
 
+        // 재진입 감지: depth counter 증가
+        int[] depth = dispatchDepth.get();
+        if (depth == null) {
+            depth = new int[]{0};
+            dispatchDepth.set(depth);
+        }
+        depth[0]++;
+
+        if (depth[0] > 1) {
+            // 재진입 호출 - 현재 trace를 stale로 잘못 인식하지 않도록 skip
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] Re-entrant WebActionDispatcher call (depth=" + depth[0] + "), skipping trace creation.");
+            }
+            return;
+        }
+
+        Object request = args[0];
+        if (request == null) {
+            return;
+        }
+        MethodCache cache = getMethodCache(request.getClass());
+        String requestURI = invokeStringMethod(cache.getRequestURI, request);
+
+        // excludeUrl 체크를 stale trace 정리보다 먼저 수행:
+        // 제외 대상 URL이면 trace를 생성하지도, 기존 trace를 건드리지도 않고 즉시 반환
+        JeusConfiguration config = JeusConfigurationHolder.getConfiguration();
+        if (config != null && requestURI != null && config.getJeusExcludeUrlFilter().filter(requestURI)) {
+            return;
+        }
+
         Trace staleTrace = traceContext.currentRawTraceObject();
         if (staleTrace != null) {
+            // depth==1이 확인된 상태이므로 현재 trace는 실제 stale trace
             logger.warn("[JEUS-PLUGIN] Stale trace detected at request start. Force removing.");
             try {
                 staleTrace.close();  // ActiveTraceRepository에서 해제
@@ -119,21 +153,11 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             traceContext.removeTraceObject();
         }
 
-        Object request = args[0];
-        MethodCache cache = getMethodCache(request.getClass());
-        String requestURI = invokeStringMethod(cache.getRequestURI, request);
-
-        JeusConfiguration config = JeusConfigurationHolder.getConfiguration();
-        if (config != null && requestURI != null && config.getJeusExcludeUrlFilter().filter(requestURI)) {
-            return;
-        }
-
         Trace trace = createTrace(request, cache);
         if (trace == null) {
             return;
         }
 
-        boolean blockBegan = false;
         try {
             if (trace.canSampled()) {
                 try {
@@ -191,7 +215,6 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             // traceBlockBegin은 canSampled 여부와 무관하게 항상 호출
             // → after()의 traceBlockEnd와 쌍을 맞춤
             trace.traceBlockBegin();
-            blockBegan = true;
         } catch (Throwable t) {
             // traceBlockBegin() 실패 시 after()에서 traceBlockEnd 쌍 불일치를 막기 위해
             // 여기서 직접 trace를 정리한다.
@@ -208,6 +231,17 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
 
     @Override
     public void after(Object target, Object[] args, Object result, Throwable throwable) {
+        // 재진입 depth 감소: before()에서 재진입으로 return된 경우에도 after()는 항상 호출됨
+        int[] depth = dispatchDepth.get();
+        if (depth != null) {
+            depth[0]--;
+            if (depth[0] > 0) {
+                // 재진입에 대한 after() - before()에서 trace를 만들지 않았으므로 skip
+                return;
+            }
+            dispatchDepth.remove();
+        }
+
         Trace trace = traceContext.currentRawTraceObject();
         if (trace == null) {
             return;
@@ -220,12 +254,14 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
                 recorder.recordApi(descriptor);
 
                 if (throwable != null) {
+                    // SpanEvent 레벨: 콜스택 상세 뷰에서 해당 span에 에러 표시
                     recorder.recordException(throwable);
-                    // 트랜잭션 레벨 에러도 SpanRecorder에 기록
+                    // Span(루트) 레벨: 트랜잭션 목록 뷰에서 해당 요청을 에러 트랜잭션으로 표시
+                    // → 두 곳에 기록하는 것이 의도된 동작 (목록+상세 양쪽에서 에러 식별 가능)
                     trace.getSpanRecorder().recordException(throwable);
                 }
 
-                if (args != null && args.length > 0) {
+                if (args != null && args.length > 0 && args[0] != null) {
                     Object request = args[0];
                     MethodCache cache = getMethodCache(request.getClass());
 
@@ -312,14 +348,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
     private MethodCache getMethodCache(Class<?> clazz) {
         MethodCache cache = methodCacheMap.get(clazz);
         if (cache == null) {
-            // WeakHashMap은 putIfAbsent 미지원 → synchronized 블록으로 원자성 보장
-            synchronized (methodCacheMap) {
-                cache = methodCacheMap.get(clazz);
-                if (cache == null) {
-                    cache = new MethodCache(clazz);
-                    methodCacheMap.put(clazz, cache);
-                }
-            }
+            MethodCache newCache = new MethodCache(clazz);
+            MethodCache existing = methodCacheMap.putIfAbsent(clazz, newCache);
+            cache = existing != null ? existing : newCache;
         }
         return cache;
     }
@@ -415,16 +446,12 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             Class<?> clazz = response.getClass();
             Method method = statusMethodCache.get(clazz);
             if (method == null) {
-                synchronized (statusMethodCache) {
-                    method = statusMethodCache.get(clazz);
-                    if (method == null) {
-                        try {
-                            method = clazz.getMethod("getStatus");
-                        } catch (Exception e) {
-                            return 0;
-                        }
-                        statusMethodCache.put(clazz, method);
-                    }
+                try {
+                    Method newMethod = clazz.getMethod("getStatus");
+                    Method existing = statusMethodCache.putIfAbsent(clazz, newMethod);
+                    method = existing != null ? existing : newMethod;
+                } catch (Exception e) {
+                    return 0;
                 }
             }
             Object result = method.invoke(response);
@@ -459,7 +486,7 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
                 }
             }
         }
-        if (mode == 3) return;
+        if (mode == 3 || uriTemplateMethod == null) return;
         try {
             if (mode == 1) {
                 uriTemplateMethod.invoke(trace, uriTemplate);
