@@ -19,6 +19,11 @@ public class JeusConfiguration {
     private final List<String> jeusTracePackages;  // 패키지 패턴 (신규)
     private final List<String> jeusTraceClasses;   // 클래스 목록 (기존 호환)
 
+    // 프레임워크 레벨 서비스 호출 트레이싱 설정
+    // ObjectHelper.invoke()를 계측하여 비즈니스 메서드 호출을 SpanEvent로 기록
+    // WAS ClassLoader 소속 클래스만 계측하므로 핫 디플로이 시 InterceptorRegistry 누적 없음
+    private final boolean jeusFrameworkTraceEnabled;
+
     // 로깅 연동 설정
     // 지정된 Appender 클래스를 계측하여 로그 발생 시 Pinpoint에 LOGGED 마킹
     // → Pinpoint Web UI에서 해당 트랜잭션에 "View Log" 버튼 활성화
@@ -37,11 +42,14 @@ public class JeusConfiguration {
 
         // 메서드 트레이싱 설정
         this.jeusMethodTraceEnabled = config.readBoolean("profiler.jeus.method.trace.enable", true);
-        this.jeusTracePackages = config.readList("profiler.jeus.trace.packages");  // 패키지 패턴 (신규)
-        this.jeusTraceClasses = config.readList("profiler.jeus.trace.classes");    // 클래스 목록 (기존 호환)
+        this.jeusTracePackages = toUnmodifiable(config.readList("profiler.jeus.trace.packages"));
+        this.jeusTraceClasses = toUnmodifiable(config.readList("profiler.jeus.trace.classes"));
+
+        // 프레임워크 레벨 서비스 호출 트레이싱
+        this.jeusFrameworkTraceEnabled = config.readBoolean("profiler.jeus.framework.trace.enable", true);
 
         // 로깅 연동 설정
-        this.jeusLoggingAppenderClasses = config.readList("profiler.jeus.logging.appender.classes");
+        this.jeusLoggingAppenderClasses = toUnmodifiable(config.readList("profiler.jeus.logging.appender.classes"));
     }
 
     public boolean isJeusEnabled() {
@@ -72,8 +80,19 @@ public class JeusConfiguration {
         return jeusTraceClasses;
     }
 
+    public boolean isJeusFrameworkTraceEnabled() {
+        return jeusFrameworkTraceEnabled;
+    }
+
     public List<String> getJeusLoggingAppenderClasses() {
         return jeusLoggingAppenderClasses;
+    }
+
+    private static List<String> toUnmodifiable(List<String> list) {
+        if (list == null || list.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return Collections.unmodifiableList(new ArrayList<String>(list));
     }
 
     public static class ExcludeUrlFilter {

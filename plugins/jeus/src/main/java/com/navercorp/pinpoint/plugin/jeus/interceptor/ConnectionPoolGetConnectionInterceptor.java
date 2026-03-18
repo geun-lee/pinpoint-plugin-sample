@@ -96,6 +96,11 @@ public class ConnectionPoolGetConnectionInterceptor implements AroundInterceptor
     }
 
     private int incrementFailedAttempts(Object target) {
+        // 안전 장치: failedAttempts 맵이 비정상적으로 커지면 정리
+        if (failedAttempts.size() > 100) {
+            logger.warn("[JEUS-DATASOURCE] failedAttempts map exceeded 100 entries, clearing stale entries");
+            failedAttempts.clear();
+        }
         AtomicInteger counter = failedAttempts.get(target);
         if (counter == null) {
             AtomicInteger newCounter = new AtomicInteger(0);

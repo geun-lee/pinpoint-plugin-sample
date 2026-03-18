@@ -94,8 +94,10 @@ public class JeusDataSourceMonitor implements DataSourceMonitor {
             if (logger.isDebugEnabled()) {
                 int count = logCounter.incrementAndGet();
                 if (count >= LOG_INTERVAL_COUNT) {
-                    logger.debug("[JEUS-DATASOURCE] " + dataSourceName + " -> Active: " + active + ", Total: " + current + ", Idle: " + idle);
-                    logCounter.set(0);
+                    // CAS로 원자적 리셋: 다른 스레드가 이미 리셋했으면 skip
+                    if (logCounter.compareAndSet(count, 0)) {
+                        logger.debug("[JEUS-DATASOURCE] " + dataSourceName + " -> Active: " + active + ", Total: " + current + ", Idle: " + idle);
+                    }
                 }
             }
 

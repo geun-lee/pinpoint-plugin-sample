@@ -47,8 +47,12 @@ public class LoggingAppenderInterceptor implements AroundInterceptor {
             return;
         }
 
-        SpanRecorder recorder = trace.getSpanRecorder();
-        recorder.recordLogging(LoggingInfo.LOGGED);
+        try {
+            SpanRecorder recorder = trace.getSpanRecorder();
+            recorder.recordLogging(LoggingInfo.LOGGED);
+        } catch (Throwable t) {
+            // 로깅 인터셉터 실패가 애플리케이션 로직에 영향을 주지 않도록 방어
+        }
     }
 
     @Override

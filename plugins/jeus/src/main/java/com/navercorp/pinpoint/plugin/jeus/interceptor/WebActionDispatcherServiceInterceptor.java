@@ -16,21 +16,26 @@ import com.navercorp.pinpoint.plugin.jeus.JeusConstants;
 
 import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class WebActionDispatcherServiceInterceptor implements AroundInterceptor {
     private final PLogger logger = PLoggerFactory.getLogger(this.getClass());
     private final TraceContext traceContext;
     private final MethodDescriptor descriptor;
 
-    // ClassLoader별 Request Method 캐싱
-    // ConcurrentHashMap: lock-free read로 요청 hot path 경합 제거
-    // → Request/Response 클래스는 JEUS WAS 클래스로더 소속으로 서버 생애 동안 유지되므로 strong key 안전
-    private static final ConcurrentHashMap<Class<?>, MethodCache> methodCacheMap =
-            new ConcurrentHashMap<Class<?>, MethodCache>();
+    // 로그 throttle: 반복 가능한 warn 로그를 10초에 1회로 제한 (로그 폭발 방지)
+    private static final long LOG_THROTTLE_MS = 10_000L;
+    private static final AtomicLong lastStaleTraceLogTime = new AtomicLong(0);
 
-    // Response.getStatus() 캐시
-    private static final ConcurrentHashMap<Class<?>, Method> statusMethodCache =
-            new ConcurrentHashMap<Class<?>, Method>();
+    // ClassLoader별 Request Method 캐싱
+    // String(className) 키: Class<?> strong reference로 인한 ClassLoader GC 차단 방지
+    // hot deploy 시 동일 className으로 put → 이전 MethodCache(old Method → old Class) 교체 → GC 가능
+    private static final ConcurrentHashMap<String, MethodCache> methodCacheMap =
+            new ConcurrentHashMap<String, MethodCache>();
+
+    // Response.getStatus() 캐시: String 키로 ClassLoader 누수 방지
+    private static final ConcurrentHashMap<String, Method> statusMethodCache =
+            new ConcurrentHashMap<String, Method>();
 
     // 재진입 감지: 동일 스레드에서 WebActionDispatcher.service()가 중첩 호출될 때
     // 첫 번째 trace를 stale로 잘못 인식하여 강제 close하는 것을 방지
@@ -144,7 +149,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         Trace staleTrace = traceContext.currentRawTraceObject();
         if (staleTrace != null) {
             // depth==1이 확인된 상태이므로 현재 trace는 실제 stale trace
-            logger.warn("[JEUS-PLUGIN] Stale trace detected at request start. Force removing.");
+            if (shouldLogThrottled(lastStaleTraceLogTime)) {
+                logger.warn("[JEUS-PLUGIN] Stale trace detected at request start. Force removing. (throttled 10s)");
+            }
             try {
                 staleTrace.close();  // ActiveTraceRepository에서 해제
             } catch (Throwable t) {
@@ -239,7 +246,12 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
                 // 재진입에 대한 after() - before()에서 trace를 만들지 않았으므로 skip
                 return;
             }
+            // depth <= 0: 정상(0) 또는 비정상 잔류 음수값 → 모두 ThreadLocal 정리
             dispatchDepth.remove();
+            if (depth[0] < 0) {
+                // before() 없이 after()가 호출된 비정상 상태 → trace 처리 건너뜀
+                return;
+            }
         }
 
         Trace trace = traceContext.currentRawTraceObject();
@@ -272,7 +284,11 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
                             : invokeStringMethod(cache.getRequestURI, request);
 
                     // JEUS 특화 URI 템플릿 (target/method 또는 business_id/submit_id)
+                    // fallback: 파라미터 기반 템플릿이 없으면 requestURI에서 추출
                     String uriTemplate = buildUriTemplate(request, cache);
+                    if (uriTemplate == null) {
+                        uriTemplate = extractUriTemplate(requestURI);
+                    }
                     if (uriTemplate != null) {
                         invokeSetAttribute(cache.setAttribute, request, "pinpoint.metric.uri-template", uriTemplate);
                         recordUriTemplate(trace, uriTemplate);
@@ -325,7 +341,12 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
 
     /**
      * JEUS 특화 URI 템플릿 추출.
-     * target+method 파라미터 또는 business_id+submit_id 파라미터 조합.
+     *
+     * 우선순위:
+     * 1. target+method 파라미터 → /target/method
+     * 2. business_id+submit_id 파라미터 → /businessId/submitId
+     * 3. .xfdl 요청 → 파일명에서 폼 ID 추출 (예: SPZUM00400_암호확인.xfdl → /xpapps/SPZUM00400)
+     * 4. null (caller에서 requestURI fallback)
      */
     private String buildUriTemplate(Object request, MethodCache cache) {
         String targetParam = invokeStringMethodWithParam(cache.getParameter, request, "target");
@@ -343,22 +364,53 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         return null;
     }
 
+    /**
+     * requestURI에서 URI 템플릿을 추출.
+     *
+     * URL-encoded 문자를 디코딩하여 한글 등이 원본 그대로 표시되도록 한다.
+     * 예: /himed2/xpapps/com/.../SPZUM00400_%EC%95%94%ED%98%B8%ED%99%95%EC%9D%B8.xfdl
+     *   → /himed2/xpapps/com/.../SPZUM00400_암호확인.xfdl
+     */
+    private static String extractUriTemplate(String requestURI) {
+        if (requestURI == null) {
+            return null;
+        }
+        try {
+            return java.net.URLDecoder.decode(requestURI, "UTF-8");
+        } catch (Exception e) {
+            return requestURI;
+        }
+    }
+
+    private static boolean shouldLogThrottled(AtomicLong lastLogTime) {
+        long now = System.currentTimeMillis();
+        long last = lastLogTime.get();
+        return now - last >= LOG_THROTTLE_MS && lastLogTime.compareAndSet(last, now);
+    }
+
     // --- ClassLoader별 Method 캐싱 ---
 
     private MethodCache getMethodCache(Class<?> clazz) {
-        MethodCache cache = methodCacheMap.get(clazz);
-        if (cache == null) {
-            MethodCache newCache = new MethodCache(clazz);
-            MethodCache existing = methodCacheMap.putIfAbsent(clazz, newCache);
-            cache = existing != null ? existing : newCache;
+        String key = clazz.getName();
+        MethodCache cache = methodCacheMap.get(key);
+        if (cache != null && cache.targetClass == clazz) {
+            return cache;
         }
-        return cache;
+        // 첫 접근 또는 ClassLoader 변경(hot deploy) → 새 캐시 생성, 이전 엔트리 교체
+        // 두 스레드가 동시에 새 MethodCache를 생성할 수 있으나 (benign race):
+        // - MethodCache는 불변(all final) → 어느 인스턴스든 동일하게 동작
+        // - hot deploy 전환 시 양쪽 모두 new Class 기준으로 생성 → 최종 결과 동일
+        // - 최악의 경우 리플렉션 1회 중복뿐, 정합성 문제 없음
+        MethodCache newCache = new MethodCache(clazz);
+        methodCacheMap.put(key, newCache);
+        return newCache;
     }
 
     /**
      * Request/Response 클래스별 Method 캐시
      */
     private static class MethodCache {
+        final Class<?> targetClass;  // identity check: hot deploy 시 ClassLoader 변경 감지용
         final Method getRequestURI;
         final Method getParameter;
         final Method getHeader;
@@ -371,6 +423,7 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         final Method getAttribute;
 
         MethodCache(Class<?> clazz) {
+            this.targetClass = clazz;
             this.getRequestURI = findMethod(clazz, "getRequestURI");
             this.getParameter = findMethod(clazz, "getParameter", String.class);
             this.getHeader = findMethod(clazz, "getHeader", String.class);
@@ -383,10 +436,15 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             this.getAttribute = findMethod(clazz, "getAttribute", String.class);
         }
 
+        private static final PLogger findMethodLogger = PLoggerFactory.getLogger(MethodCache.class);
+
         private static Method findMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
             try {
                 return clazz.getMethod(name, paramTypes);
             } catch (Exception e) {
+                if (findMethodLogger.isDebugEnabled()) {
+                    findMethodLogger.debug("[JEUS-PLUGIN] MethodCache: " + name + " not found in " + clazz.getName());
+                }
                 return null;
             }
         }
@@ -399,6 +457,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         try {
             return (String) method.invoke(target);
         } catch (Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] invokeStringMethod failed: " + method.getName(), e);
+            }
             return null;
         }
     }
@@ -408,6 +469,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         try {
             return (String) method.invoke(target, param);
         } catch (Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] invokeStringMethodWithParam failed: " + method.getName() + "(" + param + ")", e);
+            }
             return null;
         }
     }
@@ -418,6 +482,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
             Object result = method.invoke(target);
             return result instanceof Integer ? (Integer) result : defaultValue;
         } catch (Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] invokeIntMethod failed: " + method.getName(), e);
+            }
             return defaultValue;
         }
     }
@@ -427,7 +494,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         try {
             method.invoke(target, name, value);
         } catch (Exception e) {
-            // ignore
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] invokeSetAttribute failed: " + name, e);
+            }
         }
     }
 
@@ -436,6 +505,9 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         try {
             return method.invoke(target, name);
         } catch (Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] invokeGetAttribute failed: " + name, e);
+            }
             return null;
         }
     }
@@ -444,12 +516,13 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         if (response == null) return 0;
         try {
             Class<?> clazz = response.getClass();
-            Method method = statusMethodCache.get(clazz);
-            if (method == null) {
+            String key = clazz.getName();
+            Method method = statusMethodCache.get(key);
+            // ClassLoader 변경 감지: hot deploy 시 이전 Method는 새 ClassLoader 인스턴스에서 사용 불가
+            if (method == null || method.getDeclaringClass().getClassLoader() != clazz.getClassLoader()) {
                 try {
-                    Method newMethod = clazz.getMethod("getStatus");
-                    Method existing = statusMethodCache.putIfAbsent(clazz, newMethod);
-                    method = existing != null ? existing : newMethod;
+                    method = clazz.getMethod("getStatus");
+                    statusMethodCache.put(key, method);
                 } catch (Exception e) {
                     return 0;
                 }

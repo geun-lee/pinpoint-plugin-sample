@@ -21,12 +21,15 @@ public class HimedMethodInterceptor implements AroundInterceptor {
     private final TraceContext traceContext;
     private final MethodDescriptor descriptor;
 
-    // 진단용: 10초마다 한 번씩만 로그 출력 (로그 폭발 방지)
+    // 로그 throttle: 동일 종류의 로그를 10초에 1회로 제한 (로그 폭발 방지)
     // 인스턴스 필드: 메서드별로 독립적으로 throttle하여 어느 메서드에서 발생했는지 파악 가능
     // (static이면 한 메서드에서 로그 출력 시 다른 모든 메서드 로그가 10초간 차단됨)
-    private static final long DIAG_INTERVAL_MS = 10_000L;
+    private static final long LOG_THROTTLE_MS = 10_000L;
     private final AtomicLong lastNullTraceLogTime    = new AtomicLong(0);
     private final AtomicLong lastNotSampledLogTime   = new AtomicLong(0);
+    private final AtomicLong lastBeginFailLogTime    = new AtomicLong(0);
+    private final AtomicLong lastAfterErrorLogTime   = new AtomicLong(0);
+    private final AtomicLong lastEndFailLogTime      = new AtomicLong(0);
 
     // traceBlockBegin 성공 여부를 스택으로 추적: 중첩 호출 시 begin/end 쌍 보장
     // Boolean 단일값이 아닌 Deque: 메서드가 서로 중첩 호출되므로 스택이 필수
@@ -43,7 +46,6 @@ public class HimedMethodInterceptor implements AroundInterceptor {
     public void before(Object target, Object[] args) {
         Trace trace = traceContext.currentTraceObject();
         if (trace == null) {
-            // [진단] trace=NULL은 웹 요청 컨텍스트 밖의 정상 호출일 수 있음 → DEBUG
             if (logger.isDebugEnabled() && shouldLog(lastNullTraceLogTime)) {
                 logger.debug("[JEUS-PLUGIN][DIAG] HimedMethod.before: trace=NULL → thread=" + Thread.currentThread().getName()
                         + " method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
@@ -52,7 +54,6 @@ public class HimedMethodInterceptor implements AroundInterceptor {
         }
 
         if (!trace.canSampled()) {
-            // [진단] 비샘플링 트레이스는 정상 동작 → DEBUG
             if (logger.isDebugEnabled() && shouldLog(lastNotSampledLogTime)) {
                 logger.debug("[JEUS-PLUGIN][DIAG] HimedMethod.before: canSampled=false → thread=" + Thread.currentThread().getName()
                         + " method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
@@ -71,18 +72,18 @@ public class HimedMethodInterceptor implements AroundInterceptor {
             stack.push(Boolean.TRUE);   // 성공 → after()에서 traceBlockEnd 호출
         } catch (Throwable t) {
             stack.push(Boolean.FALSE);  // 실패 → after()에서 traceBlockEnd 건너뜀
-            if (logger.isWarnEnabled()) {
-                logger.warn("[JEUS-PLUGIN] traceBlockBegin failed: "
+            if (logger.isWarnEnabled() && shouldLog(lastBeginFailLogTime)) {
+                logger.warn("[JEUS-PLUGIN] traceBlockBegin failed (throttled 10s): "
                         + descriptor.getClassName() + "." + descriptor.getMethodName(), t);
             }
         }
     }
 
-    /** DIAG_INTERVAL_MS 이상 경과한 경우에만 true 반환 (문자열 생성은 호출 측에서 담당) */
+    /** LOG_THROTTLE_MS 이상 경과한 경우에만 true 반환 (문자열 생성은 호출 측에서 담당) */
     private boolean shouldLog(AtomicLong lastLogTime) {
         long now = System.currentTimeMillis();
         long last = lastLogTime.get();
-        return now - last >= DIAG_INTERVAL_MS && lastLogTime.compareAndSet(last, now);
+        return now - last >= LOG_THROTTLE_MS && lastLogTime.compareAndSet(last, now);
     }
 
     @Override
@@ -92,8 +93,13 @@ public class HimedMethodInterceptor implements AroundInterceptor {
             // 방어: before()에서 push했을 수 있으므로 정리
             ArrayDeque<Boolean> stack = blockStack.get();
             if (stack != null && !stack.isEmpty()) {
-                stack.pop();
+                Boolean began = stack.pop();
                 if (stack.isEmpty()) blockStack.remove();
+                // trace가 before/after 사이에 사라진 비정상 상태 감지
+                if (Boolean.TRUE.equals(began) && logger.isDebugEnabled()) {
+                    logger.debug("[JEUS-PLUGIN][DIAG] HimedMethod.after: trace disappeared between before/after"
+                            + " → traceBlockEnd skipped. method=" + descriptor.getClassName() + "." + descriptor.getMethodName());
+                }
             }
             return;
         }
@@ -113,8 +119,8 @@ public class HimedMethodInterceptor implements AroundInterceptor {
                 recorder.recordException(throwable);
             }
         } catch (Throwable t) {
-            if (logger.isWarnEnabled()) {
-                logger.warn("[JEUS-PLUGIN] HimedMethodInterceptor.after error: " + t.getMessage(), t);
+            if (logger.isWarnEnabled() && shouldLog(lastAfterErrorLogTime)) {
+                logger.warn("[JEUS-PLUGIN] HimedMethodInterceptor.after error (throttled 10s): " + t.getMessage(), t);
             }
         } finally {
             // before()에서 해당 메서드의 traceBlockBegin 성공 여부를 pop으로 꺼냄
@@ -128,8 +134,8 @@ public class HimedMethodInterceptor implements AroundInterceptor {
                 try {
                     trace.traceBlockEnd();
                 } catch (Throwable t) {
-                    if (logger.isWarnEnabled()) {
-                        logger.warn("[JEUS-PLUGIN] traceBlockEnd failed: " + t.getMessage(), t);
+                    if (logger.isWarnEnabled() && shouldLog(lastEndFailLogTime)) {
+                        logger.warn("[JEUS-PLUGIN] traceBlockEnd failed (throttled 10s): " + t.getMessage(), t);
                     }
                 }
             }

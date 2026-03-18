@@ -18,6 +18,7 @@ import com.navercorp.pinpoint.bootstrap.plugin.ProfilerPluginSetupContext;
 import com.navercorp.pinpoint.plugin.jeus.interceptor.ConnectionPoolGetConnectionInterceptor;
 import com.navercorp.pinpoint.plugin.jeus.interceptor.HimedMethodInterceptor;
 import com.navercorp.pinpoint.plugin.jeus.interceptor.LoggingAppenderInterceptor;
+import com.navercorp.pinpoint.plugin.jeus.interceptor.ServiceInvokeInterceptor;
 import com.navercorp.pinpoint.plugin.jeus.interceptor.WebActionDispatcherServiceInterceptor;
 
 import java.lang.ref.WeakReference;
@@ -25,7 +26,9 @@ import java.lang.reflect.Modifier;
 import java.security.ProtectionDomain;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -48,6 +51,13 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
 
         addWebActionDispatcherTransform();
 
+        // 프레임워크 레벨 서비스 호출 트레이싱 (WAS ClassLoader 소속 → 핫 디플로이 영향 없음)
+        if (config.isJeusFrameworkTraceEnabled()) {
+            addFrameworkServiceInvokeTransform();
+        }
+
+        // 비즈니스 클래스 직접 계측 (App ClassLoader 소속 → 핫 디플로이 시 InterceptorRegistry 누적)
+        // framework.trace.enable=true인 경우, 비즈니스 계측 없이도 서비스 호출 추적 가능
         if (config.isJeusMethodTraceEnabled()) {
             addHimedPackageTransform(config);
         }
@@ -82,6 +92,62 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 return target.toBytecode();
             }
         });
+    }
+
+    /**
+     * 프레임워크 레벨 서비스 호출 계측.
+     *
+     * ObjectHelper.invoke() / invokeWithTransaction()을 인터셉트하여
+     * 비즈니스 서비스 호출을 SpanEvent로 기록한다.
+     *
+     * [핵심 이점]
+     * ObjectHelper는 live-core-5.3.0.jar (WAS ClassLoader) 소속이므로
+     * 핫 디플로이해도 재계측이 발생하지 않는다.
+     * → InterceptorRegistry ID 소비 = 최초 2개로 고정 (invoke + invokeWithTransaction)
+     * → ClassLoader GC 차단 문제 원천 해결
+     *
+     * [dispatch 체인]
+     * WebActionDispatcher.process()
+     *   → processWebMultiAction() → Method.invoke()
+     *   → processWebAction() → WebAction.execute()
+     *     → XPlatformWebAction → LocalServiceDelegator.callService()
+     *       → ObjectHelper.invoke(Class, Object, String methodName, ...)  ← 여기를 계측
+     */
+    private void addFrameworkServiceInvokeTransform() {
+        transformTemplate.transform("kr.co.hit.live.util.ObjectHelper", new TransformCallback() {
+            @Override
+            public byte[] doInTransform(Instrumentor instrumentor, ClassLoader classLoader, String className,
+                    Class<?> classBeingRedefined, ProtectionDomain protectionDomain, byte[] classfileBuffer) throws InstrumentException {
+                logger.info("[JEUS-PLUGIN] Transforming framework class: " + className);
+                InstrumentClass target = instrumentor.getInstrumentClass(classLoader, className, classfileBuffer);
+
+                // ObjectHelper.invoke(Class, Object, String, Class[], Object[], boolean)
+                InstrumentMethod invokeMethod = target.getDeclaredMethod("invoke",
+                        "java.lang.Class", "java.lang.Object", "java.lang.String",
+                        "java.lang.Class[]", "java.lang.Object[]", "boolean");
+                if (invokeMethod != null) {
+                    invokeMethod.addInterceptor(ServiceInvokeInterceptor.class);
+                    logger.info("[JEUS-PLUGIN] ServiceInvokeInterceptor added to ObjectHelper.invoke()");
+                }
+
+                // ObjectHelper.invokeWithTransaction(Class, Object, String, Class[], Object[], boolean, long)
+                InstrumentMethod invokeWithTxMethod = target.getDeclaredMethod("invokeWithTransaction",
+                        "java.lang.Class", "java.lang.Object", "java.lang.String",
+                        "java.lang.Class[]", "java.lang.Object[]", "boolean", "long");
+                if (invokeWithTxMethod != null) {
+                    invokeWithTxMethod.addInterceptor(ServiceInvokeInterceptor.class);
+                    logger.info("[JEUS-PLUGIN] ServiceInvokeInterceptor added to ObjectHelper.invokeWithTransaction()");
+                }
+
+                if (invokeMethod == null && invokeWithTxMethod == null) {
+                    logger.warn("[JEUS-PLUGIN] No invoke methods found in " + className
+                            + ". Check if method signatures have changed.");
+                }
+
+                return target.toBytecode();
+            }
+        });
+        logger.info("[JEUS-PLUGIN] Framework service invoke transform registered (WAS ClassLoader, hot-deploy safe)");
     }
 
     private void addHimedPackageTransform(JeusConfiguration config) {
@@ -202,6 +268,8 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
 
             if (isHotDeploy) {
                 logger.warn("[JEUS-PLUGIN] Hot-deploy detected: " + className + " | Re-transforming with new IDs");
+                // GC된 WeakReference 엔트리 정리 (hot deploy 시점에 일괄 수행)
+                purgeGarbageCollectedEntries();
             }
 
             List<InstrumentMethod> methods = target.getDeclaredMethods(MethodFilters.modifier(Modifier.PUBLIC));
@@ -226,17 +294,39 @@ public class JeusPlugin implements ProfilerPlugin, MatchableTransformTemplateAwa
                 }
             }
 
-            logger.info("[JEUS-PLUGIN] " + className
-                    + ": added=" + addedCount
-                    + " [hot-deploy=" + isHotDeploy + "]");
+            if (logger.isDebugEnabled()) {
+                logger.debug("[JEUS-PLUGIN] " + className
+                        + ": added=" + addedCount
+                        + " [hot-deploy=" + isHotDeploy + "]");
+            }
 
             return target.toBytecode();
         }
 
+        /**
+         * GC된 WeakReference 엔트리를 transformedClasses에서 제거.
+         * 핫 디플로이 감지 시점에 호출하여 이전 ClassLoader에 대한 stale 엔트리를 정리.
+         */
+        private void purgeGarbageCollectedEntries() {
+            int purged = 0;
+            Iterator<Map.Entry<String, WeakReference<ClassLoader>>> it = transformedClasses.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, WeakReference<ClassLoader>> entry = it.next();
+                if (entry.getValue().get() == null) {
+                    it.remove();
+                    purged++;
+                }
+            }
+            if (purged > 0 && logger.isInfoEnabled()) {
+                logger.info("[JEUS-PLUGIN] Purged " + purged + " stale ClassLoader entries from transformedClasses");
+            }
+        }
+
         // 제외 대상 메서드 이름: O(1) lookup
+        // <init>, <clinit>은 getDeclaredMethods(PUBLIC)에서 반환되지 않으므로 제외
         private static final Set<String> EXCLUDED_METHODS = new HashSet<String>(Arrays.asList(
                 "toString", "hashCode", "equals", "clone", "finalize", "getClass",
-                "<init>", "<clinit>", "init", "destroy"
+                "init", "destroy"
         ));
 
         private static boolean isExcludedMethod(String methodName) {
