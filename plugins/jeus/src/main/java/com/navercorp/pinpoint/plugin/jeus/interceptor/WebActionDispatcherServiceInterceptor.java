@@ -260,38 +260,36 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
         }
 
         try {
-            if (trace.canSampled()) {
-                SpanEventRecorder recorder = trace.currentSpanEventRecorder();
-                recorder.recordServiceType(JeusConstants.JEUS_METHOD);
-                recorder.recordApi(descriptor);
+            // URI Statistics는 샘플링 여부와 무관하게 모든 요청에 대해 기록
+            if (args != null && args.length > 0 && args[0] != null) {
+                Object request = args[0];
+                MethodCache cache = getMethodCache(request.getClass());
 
-                if (throwable != null) {
-                    // SpanEvent 레벨: 콜스택 상세 뷰에서 해당 span에 에러 표시
-                    recorder.recordException(throwable);
-                    // Span(루트) 레벨: 트랜잭션 목록 뷰에서 해당 요청을 에러 트랜잭션으로 표시
-                    // → 두 곳에 기록하는 것이 의도된 동작 (목록+상세 양쪽에서 에러 식별 가능)
-                    trace.getSpanRecorder().recordException(throwable);
+                Object cachedUri = invokeGetAttribute(cache.getAttribute, request, ATTR_REQUEST_URI);
+                String requestURI = cachedUri instanceof String
+                        ? (String) cachedUri
+                        : invokeStringMethod(cache.getRequestURI, request);
+
+                String uriTemplate = buildUriTemplate(request, cache);
+                if (uriTemplate == null) {
+                    uriTemplate = extractUriTemplate(requestURI);
+                }
+                if (uriTemplate != null) {
+                    invokeSetAttribute(cache.setAttribute, request, "pinpoint.metric.uri-template", uriTemplate);
+                    recordUriTemplate(trace, uriTemplate);
                 }
 
-                if (args != null && args.length > 0 && args[0] != null) {
-                    Object request = args[0];
-                    MethodCache cache = getMethodCache(request.getClass());
+                if (trace.canSampled()) {
+                    SpanEventRecorder recorder = trace.currentSpanEventRecorder();
+                    recorder.recordServiceType(JeusConstants.JEUS_METHOD);
+                    recorder.recordApi(descriptor);
 
-                    // before에서 캐싱한 값 재사용
-                    Object cachedUri = invokeGetAttribute(cache.getAttribute, request, ATTR_REQUEST_URI);
-                    String requestURI = cachedUri instanceof String
-                            ? (String) cachedUri
-                            : invokeStringMethod(cache.getRequestURI, request);
-
-                    // JEUS 특화 URI 템플릿 (target/method 또는 business_id/submit_id)
-                    // fallback: 파라미터 기반 템플릿이 없으면 requestURI에서 추출
-                    String uriTemplate = buildUriTemplate(request, cache);
-                    if (uriTemplate == null) {
-                        uriTemplate = extractUriTemplate(requestURI);
+                    if (throwable != null) {
+                        recorder.recordException(throwable);
+                        trace.getSpanRecorder().recordException(throwable);
                     }
+
                     if (uriTemplate != null) {
-                        invokeSetAttribute(cache.setAttribute, request, "pinpoint.metric.uri-template", uriTemplate);
-                        recordUriTemplate(trace, uriTemplate);
                         recorder.recordAttribute(AnnotationKey.HTTP_PARAM, "UriTemplate=" + uriTemplate);
                     }
 
@@ -310,9 +308,18 @@ public class WebActionDispatcherServiceInterceptor implements AroundInterceptor 
                         if (statusCode <= 0) statusCode = 200;
                         recorder.recordAttribute(AnnotationKey.HTTP_STATUS_CODE, statusCode);
                     }
+                } else if (throwable != null) {
+                    trace.getSpanRecorder().recordException(throwable);
+                }
+            } else if (trace.canSampled()) {
+                SpanEventRecorder recorder = trace.currentSpanEventRecorder();
+                recorder.recordServiceType(JeusConstants.JEUS_METHOD);
+                recorder.recordApi(descriptor);
+                if (throwable != null) {
+                    recorder.recordException(throwable);
+                    trace.getSpanRecorder().recordException(throwable);
                 }
             } else if (throwable != null) {
-                // 비샘플링이더라도 예외는 SpanRecorder에 기록
                 trace.getSpanRecorder().recordException(throwable);
             }
         } catch (Throwable t) {
